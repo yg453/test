@@ -206,3 +206,15 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .DS_Store
+
+# --- 自定义项目补充 ---
+# 忽略所有 SQLite 数据库文件（保护你的数据不被误传）
+*.db
+*.db-journal
+
+# 忽略程序运行生成的测试/探索数据
+Database_test/*.json
+Database_test/stock_data_exploration_*.json
+
+# 如果你确定不需要跟踪 .DS_Store，模板里已经有了，但再加一行也无妨
+.DS_Store
