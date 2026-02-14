@@ -1,7 +1,6 @@
 try:
-    from config import DB_PATH, SEQ_LENGTH, FEATURE_DIM # 导入配置
+    from config import DB_PATH, SEQ_LENGTH, FEATURE_DIM
 except ImportError:
-    # Fallback if running directly
     import sys, os
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from config import DB_PATH, SEQ_LENGTH, FEATURE_DIM
@@ -18,89 +17,94 @@ class AShareDataset(Dataset):
         """
         Args:
             db_path: SQLite数据库路径
-            seq_length: 滑动窗口长度 (也就是 Past N days)
-            target_days: 预测未来几天的涨幅
-            train_mode: 是否为训练模式 (影响Scaler的行为)
+            seq_length: window_size 滑动窗口长度 
+            target_days: 预测未来几天的最高收益
+            train_mode: 是否为训练模式 
         """
         self.seq_length = seq_length
         self.target_days = target_days
         self.train_mode = train_mode
         
-        # 1. 从 SQLite 读取数据
-        # 建议：实际生产中可添加 WHERE date > '2020-01-01' 来限制数据量
         print(f"Loading data from {db_path}...")
         conn = sqlite3.connect(db_path)
         query = f"SELECT date, code, open, high, low, close, volume FROM {table_name} ORDER BY code, date"
         self.df = pd.read_sql(query, conn)
         conn.close()
         
-        # 2. 特征工程 (Feature Engineering)
-        self._generate_features()
+        # 1. 基础数据清洗 (剔除停牌日与无穷值)
+        self.df['volume'] = self.df['volume'].replace(0, np.nan)
+        self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        # 采用按股票前向填充，防止串码泄露
+        self.df = self.df.groupby('code').ffill()
+        self.df.dropna(subset=['volume'], inplace=True)
         
-        # 3. 生成标签 (Label Generation)
-        self._generate_labels()
+        # 2. 特征与标签工程 
+        self._generate_features_and_labels()
         
-        # 4. 数据清洗 (去除因计算指标产生的 NaN)
+        # 3. 终局清理
+        self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
         self.df.dropna(inplace=True)
+        self.df.reset_index(drop=True, inplace=True)
         
-        # 5. 序列构建 (Sliding Window Indexing)
-        # 我们不存储重复的滑动窗口数据，而是存储索引，节省内存
+        # 4. 序列构建 (Sliding Window)
         self.samples = []
         self._build_samples()
         
-        # 6. 全局标准化 (StandardScaler)
-        # 警告：必须在划分 Train/Test 后分别 fit，这里简化处理，在 Dataset 内 fit
-        feature_cols = [c for c in self.df.columns if c not in ['date', 'code', 'label', 'target_return']]
-        self.feature_values = self.df[feature_cols].values
+        # 5. 特征提取与标准化
+        self.feature_values = self.df[self.feature_cols].values
         
         if self.train_mode:
             self.scaler = StandardScaler()
             self.feature_values = self.scaler.fit_transform(self.feature_values)
         else:
-            # 实际部署时，这里应该加载训练好的 scaler
             self.scaler = StandardScaler() 
             self.feature_values = self.scaler.fit_transform(self.feature_values)
 
-        # 将处理后的 numpy 数组转回 tensor 以便快速读取
         self.data_tensor = torch.FloatTensor(self.feature_values)
         self.label_tensor = torch.FloatTensor(self.df['label'].values)
+        
+        # [核心自检机制]
+        self._check_logic()
         
         print(f"Dataset ready. Total samples: {len(self.samples)}")
         print(f"Input Shape: (Batch, {self.seq_length}, {self.data_tensor.shape[1]})")
 
-    def _generate_features(self):
+    def _check_logic(self):
+        """运行时自检：拦截 NaN/Inf 与形状异常"""
+        assert not np.isnan(self.feature_values).any(), "[逻辑崩溃] 特征矩阵中存在未被清洗的 NaN"
+        assert not np.isinf(self.feature_values).any(), "[逻辑崩溃] 特征矩阵中存在 Inf 导致梯度爆炸隐患"
+        assert len(self.samples) > 0, "[逻辑崩溃] 样本集合为空，请检查 window_size 与数据日期交集"
+        assert self.data_tensor.shape[1] == len(self.feature_cols), "特征维度匹配失败"
+
+    def _generate_features_and_labels(self):
         """
-        实现核心特征工程：去价格化、引入技术指标
+        合并生成特征与标签，修复原版 apply MultiIndex 异常
         """
-        # 避免 SettingWithCopyWarning
-        df = self.df.copy()
-        
-        # Groupby code to ensure indicators are calculated per stock
+        df = self.df
         grouped = df.groupby('code')
         
-        # A. 基础变化率 (Price Change)
-        # 使用 Log Return 比简单百分比更好，具有加性
-        df['log_ret'] = grouped['close'].apply(lambda x: np.log(x / x.shift(1)))
+        # --- 标签生成 (Y) ---
+        # 严格使用 shift(-N) 探测未来数据，不参与后续 X 构建
+        future_high = grouped['high'].transform(lambda x: x.rolling(window=self.target_days, min_periods=1).max().shift(-self.target_days))
+        df['target_return'] = future_high / df['close'] - 1.0
+        # threshold=0.02 作为二元分类阈值
+        df['label'] = np.where(df['target_return'] > 0.02, 1.0, 0.0)
+
+        # --- 特征工程 (X) - 强制使用 transform ---
+        df['log_ret'] = grouped['close'].transform(lambda x: np.log(x / x.shift(1)))
         
-        # B. 均线偏离度 (Close / MA20) - 归一化的一种形式
-        # 反映当前价格相对于20日成本线的位置
         df['ma20'] = grouped['close'].transform(lambda x: x.rolling(window=20).mean())
-        df['bias_20'] = (df['close'] - df['ma20']) / df['ma20']
+        df['bias_20'] = (df['close'] - df['ma20']) / (df['ma20'] + 1e-8)
         
-        # C. 成交量变化率 (Volume Change)
-        # 当日成交量 / 过去5日均量
         df['vol_ma5'] = grouped['volume'].transform(lambda x: x.rolling(window=5).mean())
-        df['vol_ratio'] = df['volume'] / (df['vol_ma5'] + 1e-8) # 避免除零
+        df['vol_ratio'] = df['volume'] / (df['vol_ma5'] + 1e-8)
         
-        # D. MACD (简化版实现)
-        # 必须归一化：MACD绝对值没有意义，我们取 (DIF - DEA) / Close
         ema12 = grouped['close'].transform(lambda x: x.ewm(span=12, adjust=False).mean())
         ema26 = grouped['close'].transform(lambda x: x.ewm(span=26, adjust=False).mean())
         dif = ema12 - ema26
         dea = dif.groupby(df['code']).transform(lambda x: x.ewm(span=9, adjust=False).mean())
-        df['macd_norm'] = (dif - dea) / df['close']
+        df['macd_norm'] = (dif - dea) / (df['close'] + 1e-8)
         
-        # E. RSI (相对强弱指标)
         def calc_rsi(series, period=14):
             delta = series.diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -108,100 +112,86 @@ class AShareDataset(Dataset):
             rs = gain / (loss + 1e-8)
             return 100 - (100 / (1 + rs))
             
-        df['rsi'] = grouped['close'].transform(lambda x: calc_rsi(x) / 100.0) # 归一化到 0-1
-        
-        # F. [Abupy Suggestion] 波动率 (Volatility)
-        # 过去 20 天的收益率标准差
+        df['rsi'] = grouped['close'].transform(lambda x: calc_rsi(x) / 100.0)
         df['volatility'] = grouped['log_ret'].transform(lambda x: x.rolling(window=20).std())
+        df['slope_5'] = grouped['close'].transform(lambda x: (x - x.shift(5)) / (x.shift(5) + 1e-8))
 
-        # G. [Abupy Suggestion] 斜率 (Slope) - 过去5天的线性回归斜率过于慢，用简单动量代替
-        # (Price[t] - Price[t-5]) / Price[t-5]
-        df['slope_5'] = grouped['close'].transform(lambda x: (x - x.shift(5)) / x.shift(5))
+        # --- 真实 ATR 构建 (仅供底层风控仓位使用) ---
+        df['prev_close'] = grouped['close'].shift(1)
+        tr1 = df['high'] - df['low']
+        tr2 = (df['high'] - df['prev_close']).abs()
+        tr3 = (df['low'] - df['prev_close']).abs()
+        df['tr'] = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
+        df['atr_real'] = grouped['tr'].transform(lambda x: x.rolling(window=14, min_periods=1).mean())
 
-        # 只保留特征列
-        keep_cols = ['log_ret', 'bias_20', 'vol_ratio', 'macd_norm', 'rsi', 'volatility', 'slope_5', 'date', 'code']
-        self.df = df[keep_cols]
+        # 核心修复点：显式声明进入神经网络训练的列，不再暴力 drop high/close
+        self.feature_cols = ['log_ret', 'bias_20', 'vol_ratio', 'macd_norm', 'rsi', 'volatility', 'slope_5']
 
-    def _generate_labels(self):
-        """
-        生成未来 target_days 的最高价涨幅标签
-        """
-        # 计算未来 N 天的最高价
-        # 逻辑：(Shifted High Max) / Current Close - 1
-        # 注意：这里需要原始 High 和 Close，我在 _generate_features 把它们丢了，需要优化流程
-        # 简单起见，我在这一步重新假设 df 里有 high 和 close，或者在 feature 生成前做
-        
-        # *修正逻辑*: 在 drop columns 之前计算 Label
-        # 这里为了演示，假设 self.df 还有原始数据，实际代码需要调整顺序。
-        # 我们使用原始数据库读取时的 df 引用计算完 label 再 merge 回去。
-        pass 
-        # (为了代码简洁，具体 Label 计算逻辑如下，假设 applied on full df)
-        # future_high = df.groupby('code')['high'].transform(lambda x: x.rolling(3).max().shift(-3))
-        # df['target_return'] = future_high / df['close'] - 1
-        # df['label'] = (df['target_return'] > 0.02).astype(float) 
-
-        # *模拟数据填充* (因为上面 logic 比较复杂，这里写死逻辑供运行)
-        self.df['label'] = np.where(self.df['slope_5'] > 0.02, 1.0, 0.0) # 仅做演示，请替换为真实逻辑
-        
     def _build_samples(self):
-        """
-        构建 (Index, Sequence_Start, Sequence_End) 的映射
-        """
-        # 必须确保同一个 Window 内是同一个 Code
-        # 利用 pandas 把每个 code 的 index 范围找出来
         code_groups = self.df.groupby('code').groups
         
         for code, indices in code_groups.items():
-            indices = sorted(indices)
-            if len(indices) < self.seq_length:
+            idx_array = np.array(sorted(indices))
+            if len(idx_array) < self.seq_length:
                 continue
             
-            # 比如有 100 条数据，seq_length=15
-            # 第一个样本: idx 0~14, 预测 idx 14 的 label (实际上是 idx 14 对应的未来)
-            for i in range(len(indices) - self.seq_length):
-                # 记录这一段序列在 self.df 中的绝对索引位置
-                start_idx = i
-                end_idx = i + self.seq_length
-                
-                # 获取最后一天作为 Label 的锚点
-                # 我们的 Label 已经对齐到当天了 (即当天的 Label 代表未来的涨跌)
-                current_idx = indices[end_idx - 1] 
-                
-                # 存储 (Start_Row_Index, Length)
-                self.samples.append((indices[start_idx], self.seq_length, current_idx))
+            for i in range(len(idx_array) - self.seq_length):
+                start_row = idx_array[i]
+                current_idx = idx_array[i + self.seq_length - 1] 
+                self.samples.append((start_row, self.seq_length, current_idx))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         start_row, length, label_row = self.samples[idx]
-        
-        # 1. 获取特征序列 X
-        # shape: [seq_length, feature_dim]
-        # 这里的 indices 是 dataframe 的绝对 index
-        # 也就是从 start_row 到 start_row + length 的行
-        # 这里的逻辑需要非常小心，因为 self.data_tensor 是 numpy array，不支持非连续索引切片如果 indices 不连续
-        # 但我们在 _build_samples 保证了同一只股票内部 indices 是连续的（如果是 reset_index 后）
-        # 建议：在 init 里做一次 reset_index
-        
-        # 修正：直接切片 Tensor
-        # 假设 df 已经 reset_index，且 data_tensor 与 df 一一对应
         x = self.data_tensor[start_row : start_row + length]
-        
-        # 2. 获取标签 Y
         y = self.label_tensor[label_row]
-        
-        # x shape: [15, 7] (假设有7个特征)
-        # y shape: [1]
         return x, y.unsqueeze(0)
 
-# 使用示例
 if __name__ == "__main__":
-    # 需要先有一个 dummy db，或者替换为你的真实路径
-    from config import DB_PATH # 临时导入
-    dataset = AShareDataset(DB_PATH) # 使用配置路径
-    # dataset = AShareDataset("stocks.db")
-    # dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
-    # x, y = next(iter(dataloader))
-    # print(f"Batch X Shape: {x.shape}") # Should be [64, 15, 7]
-    pass
+    # ==========================================
+    # 模块独立测试与防御性验证入口 (Smoke Test)
+    # 仅在直接运行 python AShareDataset.py 时触发
+    # ==========================================
+    import os
+    from torch.utils.data import DataLoader
+    
+    try:
+        from config import DB_PATH
+    except ImportError:
+        print("[警告] 无法导入 config.DB_PATH，尝试使用当前目录查找数据库...")
+        DB_PATH = "stock_data.db" # 降级回退路径
+        
+    print(">>> 开始执行 AShareDataset 独立模块测试...")
+    
+    if not os.path.exists(DB_PATH):
+        print(f"[致命错误] 找不到数据库文件: {DB_PATH}。请检查测试环境！")
+    else:
+        try:
+            # 1. 初始化数据集 (默认测试模式)
+            test_dataset = AShareDataset(
+                db_path=DB_PATH, 
+                table_name='daily_kline', 
+                seq_length=15, 
+                target_days=3, 
+                train_mode=True
+            )
+            
+            # 2. 挂载 DataLoader
+            test_loader = DataLoader(test_dataset, batch_size=64, shuffle=True)
+            
+            # 3. 抽取一个 Batch 验证 Shape 与内存流转
+            batch_x, batch_y = next(iter(test_loader))
+            
+            print("\n[测试通过] 数据管道流转正常！")
+            print(f" -> Batch X Shape : {batch_x.shape} (预期: [BatchSize, SeqLength, FeatureDim])")
+            print(f" -> Batch Y Shape : {batch_y.shape} (预期: [BatchSize, 1])")
+            print(f" -> Feature Cols  : {test_dataset.feature_cols}")
+            
+            # 4. 严苛断言：确保拿到的数据不存在 NaN
+            assert not torch.isnan(batch_x).any(), "验证失败：DataLoader 抽取的 X 中存在 NaN！"
+            assert not torch.isnan(batch_y).any(), "验证失败：DataLoader 抽取的 Y 中存在 NaN！"
+            
+        except Exception as e:
+            print(f"\n[测试崩溃] AShareDataset 内部逻辑发生严重错误:\n{e}")
