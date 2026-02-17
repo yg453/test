@@ -6,7 +6,7 @@ A股交易管理器 - Kelly + ATR 动态仓位版
 import math
 
 class TradeManager:
-    def __init__(self, initial_capital=100000.0, min_prob_threshold=0.52, max_risk_per_trade=0.03, risk_reward_ratio=2.0):
+    def __init__(self, initial_capital=10000000.0, min_prob_threshold=0.52, max_risk_per_trade=0.03, risk_reward_ratio=2.0):
         """
         :param initial_capital: 初始资金
         :param min_prob_threshold: 最小开仓概率（降至0.52，依托Kelly控制风险）

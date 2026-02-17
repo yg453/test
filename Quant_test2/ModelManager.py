@@ -41,7 +41,7 @@ class ModelManager:
             print(f"\n[ModelManager] 🏆 触发入库条件! PnL: {pnl:.2f} 成功打榜.")
             stock_dir = self.get_stock_dir(stock_code)
             
-            for m in models: m['checkpoint'] = torch.load(m['path'])
+            for m in models: m['checkpoint'] = torch.load(m['path'], weights_only=False)
                 
             new_checkpoint = {'model_state': model.state_dict(), 'scaler': scaler}
             models.append({'pnl': pnl, 'seed': seed, 'checkpoint': new_checkpoint})
@@ -66,4 +66,5 @@ class ModelManager:
             raise ValueError(f"找不到排名为 {rank} 的模型。目前库中仅有 {len(models)} 个。")
         target = models[rank - 1]
         print(f"[ModelManager] 成功加载排名第 {rank} 的模型 (Seed: {target['seed']}, 历史PnL: {target['pnl']:.2f})")
-        return torch.load(target['path']), target['seed']
+        # [核心修复 2] 显式声明 weights_only=False
+        return torch.load(target['path'], weights_only=False), target['seed']
